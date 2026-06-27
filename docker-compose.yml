@@ -1,0 +1,40 @@
+services:
+  redis:
+    image: redis:7
+    container_name: contenedor-redis
+    ports:
+      - "6379:6379"
+
+  metricas:
+    build: ./Metricas
+    container_name: contenedor-metricas
+    ports:
+      - "5002:5002"
+
+  generador-respuestas:
+    build: ./generador-respuestas
+    container_name: contenedor-respuestas
+    ports:
+      - "5001:5001"
+    depends_on:
+      - metricas
+
+  servicio-cache:
+    build: ./cache
+    container_name: contenedor-cache
+    ports:
+      - "5000:5000"
+    environment:
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
+      - generador-respuestas
+      - metricas
+
+  generador-trafico:
+    build: ./generador-trafico
+    container_name: contenedor-trafico
+    command: python generador_trafico.py
+    restart: "no"
+    depends_on:
+      - servicio-cache
