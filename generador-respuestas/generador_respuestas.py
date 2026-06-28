@@ -1,32 +1,30 @@
 import time
 import random
+import json
 import pandas as pd
-import numpy as np
-from flask import Flask, request, jsonify
+import os
+from kafka import KafkaConsumer, KafkaProducer
 
-app = Flask(__name__)
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
 
+print("INICIANDO GENERADOR DE RESPUESTAS", flush=True)
 
-def generar_dataset():
+def crear_dataset():
     zonas = ["Z1", "Z2", "Z3", "Z4", "Z5"]
 
     datos = []
-
     for i in range(2000):
         datos.append({
             "id": i,
-            "zona_id": random.choice(zonas),
-            "area_in_meters": random.uniform(10, 500),
-            "confidence": random.uniform(0, 1)
+            "zona": random.choice(zonas),
+            "area": random.uniform(10, 500),
+            "confianza": random.random()
         })
 
     return pd.DataFrame(datos)
 
 
-df = generar_dataset()
-print("Dataset cargado en memoria")
-
-
+df = crear_dataset()
 
 AREAS_ZONA = {
     "Z1": 0.625,
@@ -37,127 +35,114 @@ AREAS_ZONA = {
 }
 
 
+def crear_consumidor():
+    return KafkaConsumer(
+        "cache_miss",
+        bootstrap_servers=KAFKA_BROKER,
+        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        auto_offset_reset="latest",
+        group_id="generador-respuestas"
+    )
 
-def filtrar_datos(zona, conf_min):
+
+def crear_productor():
+    return KafkaProducer(
+        bootstrap_servers=KAFKA_BROKER,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        acks="all"
+    )
+
+
+consumidor = crear_consumidor()
+productor = crear_productor()
+
+
+def filtrar_datos(zona, confianza_minima):
     return df[
-        (df["zona_id"] == zona) &
-        (df["confidence"] >= conf_min)
+        (df["zona"] == zona) &
+        (df["confianza"] >= confianza_minima)
     ]
 
 
+def procesar_consulta(consulta):
+    request = consulta["request"]
+    operacion = request["operacion"]
 
-@app.route("/compute", methods=["POST"])
-def compute():
+    zona = request.get("zona_id")
+    confianza = float(request.get("confidence_min", 0))
 
-    inicio = time.time()
-    consulta = request.json
+    time.sleep(random.uniform(0.2, 0.8))
 
-    operacion = consulta.get("operacion")
-    zona = consulta.get("zona_id")
-    conf = float(consulta.get("confidence_min", 0.0))
-
-    # simulación de carga computacional
-    time.sleep(random.uniform(0.2, 1.0))
-
-    resultado = {}
-
-    
     if operacion == "Q1":
-        datos = filtrar_datos(zona, conf)
+        datos = filtrar_datos(zona, confianza)
+        return {"conteo": len(datos)}
 
-        resultado = {
-            "conteo_puntos": len(datos)
-        }
-
-    
     elif operacion == "Q2":
-        datos = filtrar_datos(zona, conf)
-
-        resultado = {
-            "avg_area": float(datos["area_in_meters"].mean()) if len(datos) else 0,
-            "total_area": float(datos["area_in_meters"].sum()) if len(datos) else 0,
-            "n": int(len(datos))
+        datos = filtrar_datos(zona, confianza)
+        return {
+            "promedio_area": float(datos["area"].mean()) if len(datos) else 0,
+            "total_area": float(datos["area"].sum()) if len(datos) else 0
         }
 
-    
     elif operacion == "Q3":
-        datos = filtrar_datos(zona, conf)
+        datos = filtrar_datos(zona, confianza)
+        area = AREAS_ZONA.get(zona, 1)
+        return {"densidad": len(datos) / area}
 
-        count = len(datos)
-        area_km2 = AREAS_ZONA.get(zona, 1)
-
-        resultado = {
-            "densidad_puntos_km2": count / area_km2
-        }
-
-    
     elif operacion == "Q4":
+        zona_a = request.get("zona_id_a")
+        zona_b = request.get("zona_id_b")
 
-        zona_a = consulta.get("zona_id_a")
-        zona_b = consulta.get("zona_id_b")
-
-        datos_a = filtrar_datos(zona_a, conf)
-        datos_b = filtrar_datos(zona_b, conf)
+        datos_a = filtrar_datos(zona_a, confianza)
+        datos_b = filtrar_datos(zona_b, confianza)
 
         dens_a = len(datos_a) / AREAS_ZONA.get(zona_a, 1)
         dens_b = len(datos_b) / AREAS_ZONA.get(zona_b, 1)
 
-        resultado = {
-            "zone_a_density": dens_a,
-            "zone_b_density": dens_b,
-            "winner": zona_a if dens_a > dens_b else zona_b
+        return {
+            "zona_a": dens_a,
+            "zona_b": dens_b,
+            "ganador": zona_a if dens_a > dens_b else zona_b
         }
 
-        
     elif operacion == "Q5":
-
-        datos = filtrar_datos(zona, conf)
-        bins = int(consulta.get("bins", 5))
+        datos = filtrar_datos(zona, confianza)
+        bins = int(request.get("bins", 5))
 
         if len(datos) == 0:
-            resultado = {
-                "bins": bins,
-                "histograma": [],
-                "n": 0
-            }
+            return {"bins": bins, "histograma": []}
 
-        else:
+        cortes = pd.cut(datos["confianza"], bins=bins)
+        frecuencias = cortes.value_counts().sort_index()
 
-            conteo, limites = pd.cut(
-                datos["confidence"],
-                bins=bins,
-                retbins=True
-            )
+        return {
+            "bins": bins,
+            "histograma": [
+                {"intervalo": str(k), "frecuencia": int(v)}
+                for k, v in frecuencias.items()
+            ]
+        }
 
-            frecuencias = conteo.value_counts().sort_index()
-
-            resultado = {
-                "bins": bins,
-                "histograma": [
-                    {
-                        "intervalo": str(intervalo),
-                        "frecuencia": int(frecuencia)
-                    }
-                    for intervalo, frecuencia in frecuencias.items()
-                ],
-                "n": int(len(datos))
-            }
-
-    
-    else:
-        return jsonify({
-            "estado": "error",
-            "msg": "operacion invalida"
-        }), 400
-
-    
-    latencia = time.time() - inicio
-
-    return jsonify({
-        "resultado": resultado,
-        "latencia_seg": round(latencia, 4)
-    }), 200
+    return {}
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001)
+print("ESCUCHANDO cache_miss", flush=True)
+
+for mensaje in consumidor:
+
+    datos = mensaje.value
+
+    print("MISS RECIBIDO")
+    print(json.dumps(datos, indent=2, ensure_ascii=False), flush=True)
+
+    resultado = procesar_consulta(datos)
+
+    respuesta = {
+        "key": datos["key"],
+        "resultado": resultado
+    }
+
+    productor.send("responses", respuesta)
+    productor.flush()
+
+    print("RESPUESTA ENVIADA A KAFKA: responses", flush=True)

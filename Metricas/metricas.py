@@ -6,8 +6,6 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-
-
 EVENTOS = []
 
 CONFIG = {
@@ -16,55 +14,69 @@ CONFIG = {
     "ttl": None
 }
 
-
-
-redis_host = os.getenv("REDIS_HOST", "redis")
-redis_port = int(os.getenv("REDIS_PORT", 6379))
-
 redis_cliente = redis.Redis(
-    host=redis_host,
-    port=redis_port,
+    host=os.getenv("REDIS_HOST", "redis"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
     decode_responses=True
 )
+
+URL_CACHE = os.getenv("URL_CACHE", "http://contenedor-cache:5000/registrar")
+
+
+
+def normalizar_evento(evento: dict):
+
+    tipo = evento.get("evento")
+
+    
+    if tipo in ["eviccion", "eviction"]:
+        evento["evento"] = "eviction"
+
+    return evento
 
 
 
 @app.route("/registrar", methods=["POST"])
 def registrar():
 
-    evento = request.json
+    evento = request.json or {}
     evento["timestamp"] = time.time()
 
-    CONFIG["politica"] = evento.get("politica")
-    CONFIG["tamano"] = evento.get("tamano")
-    CONFIG["ttl"] = evento.get("ttl")
+    evento = normalizar_evento(evento)
+
+    
+    if evento.get("politica") is not None:
+        CONFIG["politica"] = evento["politica"]
+
+    if evento.get("tamano") is not None:
+        CONFIG["tamano"] = evento["tamano"]
+
+    if evento.get("ttl") is not None:
+        CONFIG["ttl"] = evento["ttl"]
 
     EVENTOS.append(evento)
 
     return jsonify({"ok": True}), 200
 
-
-
-
 @app.route("/reporte", methods=["GET"])
 def reporte():
 
-    if len(EVENTOS) == 0:
+    if not EVENTOS:
         return jsonify({"mensaje": "sin datos"}), 200
 
     
+    hits = sum(1 for e in EVENTOS if e.get("evento") == "hit")
+    misses = sum(1 for e in EVENTOS if e.get("evento") == "miss")
+    basura = sum(1 for e in EVENTOS if e.get("evento") == "basura")
+    evicciones = sum(1 for e in EVENTOS if e.get("evento") == "eviction")
 
-    hits = sum(1 for e in EVENTOS if e["evento"] == "hit")
-    misses = sum(1 for e in EVENTOS if e["evento"] == "miss")
-    basura = sum(1 for e in EVENTOS if e["evento"] == "basura")
-    evicciones = sum(1 for e in EVENTOS if e["evento"] == "eviccion")
+    respuestas = sum(1 for e in EVENTOS if e.get("evento") == "respuesta")
 
     
-
     latencias = [
         e["latencia"]
         for e in EVENTOS
-        if e.get("latencia") is not None
+        if isinstance(e.get("latencia"), (int, float))
     ]
 
     if latencias:
@@ -75,67 +87,41 @@ def reporte():
     else:
         promedio = p50 = p90 = p95 = 0.0
 
-    
-
-    tiempos = [e["timestamp"] for e in EVENTOS]
+   
+    tiempos = [e["timestamp"] for e in EVENTOS if "timestamp" in e]
 
     if len(tiempos) > 1:
-        tiempo_total = max(tiempos) - min(tiempos)
-
-        if tiempo_total == 0:
-            throughput = 0
-        else:
-            throughput = round(len(EVENTOS) / tiempo_total, 2)
+        dt = max(tiempos) - min(tiempos)
+        throughput = round(len(EVENTOS) / dt, 2) if dt > 0 else 0
     else:
         throughput = 0
 
     
-
-    consultas_validas = hits + misses
-
-    if consultas_validas > 0:
-        hit_rate = round((hits / consultas_validas) * 100, 2)
-    else:
-        hit_rate = 0
+    total = hits + misses
+    hit_rate = round((hits / total) * 100, 2) if total else 0
 
     
-
     peso_total = 0
     peso_por_llave = {}
 
     try:
-
-        claves = redis_cliente.keys("*")
-
-        for llave in claves:
-
-            valor = redis_cliente.get(llave)
-
-            if valor is None:
-                continue
-
-            # tamaño aproximado: llave + valor
-            tam = len(llave.encode("utf-8")) + len(valor.encode("utf-8"))
-
-            peso_por_llave[llave] = tam
-            peso_total += tam
-
-    except Exception:
-
-        peso_total = 0
-        peso_por_llave = {}
-
-    
+        for k in redis_cliente.keys("*"):
+            v = redis_cliente.get(k)
+            if v:
+                tam = len(k.encode("utf-8")) + len(v.encode("utf-8"))
+                peso_por_llave[k] = tam
+                peso_total += tam
+    except:
+        pass
 
     return jsonify({
-
         "configuracion_sistema": CONFIG,
 
         "resumen_trafico": {
-            "total_eventos": consultas_validas + basura,
             "cache_hits": hits,
             "cache_misses": misses,
             "consultas_basura": basura,
+            "total ": hits+misses+basura,
             "hit_rate": f"{hit_rate}%"
         },
 
@@ -153,8 +139,7 @@ def reporte():
             "peso_por_llave": peso_por_llave,
             "llaves_en_cache": len(peso_por_llave)
         }
-
-    }), 200
+    })
 
 
 if __name__ == "__main__":

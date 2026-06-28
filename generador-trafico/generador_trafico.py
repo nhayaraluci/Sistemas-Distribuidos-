@@ -1,13 +1,13 @@
 import time
 import random
 import json
-import requests
-import sys
 import uuid
+from kafka import KafkaProducer
 
 time.sleep(10)
 
-URL_CACHE = "http://servicio-cache:5000/query"
+KAFKA_BROKER = "kafka:9092"
+TOPIC = "queries" # nombre en donde se envia 
 
 PROB_BASURA = 0.15
 INTERVALO = 0.8
@@ -25,102 +25,80 @@ CONSULTAS_FRECUENTES = [
 OPERACIONES = ["Q1", "Q2", "Q3", "Q4", "Q5"]
 
 
+producer = None
+
+while producer is None:
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BROKER,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            acks="all",
+            retries=10
+        )
+        print("Kafka conectado ")
+    except Exception as e:
+        print("Esperando Kafka...", e)
+        time.sleep(3)
+
 
 def zipf_choice(items):
-    pesos = [1 / (i + 1) for i in range(len(items))]
-    total = sum(pesos)
-    return random.choices(items, weights=[p / total for p in pesos])[0]
+    weights = [1 / (i + 1) for i in range(len(items))]
+    total = sum(weights)
+    return random.choices(items, weights=[w / total for w in weights])[0]
 
-
-#
 def generar_basura():
-    tipos = ["Q99", "INVALID", ""]
     return {
         "request_id": str(uuid.uuid4()),
-        "operacion": random.choice(tipos),
+        "operacion": random.choice(["Q99", "INVALID", ""]),
         "zona_id": random.choice(ZONAS)
     }
 
-
 def generar_consulta():
 
-    # BASURA
     if random.random() < PROB_BASURA:
         return generar_basura()
 
-    # FRECUENTES   --> se cambia para aumentar hit 
     if random.random() < 0.8:
         op, zona, conf = random.choice(CONSULTAS_FRECUENTES)
         return {
             "request_id": str(uuid.uuid4()),
             "operacion": op,
             "zona_id": zona,
-            "confidence_min": conf,
-            "bbox": {}
+            "confidence_min": conf
         }
 
-    # ZIPF 
-    if random.random() < 0.4:
-        op = random.choice(OPERACIONES)
-        zona = zipf_choice(ZONAS)
-    else:
-        # 4. UNIFORME (IMPORTANTE PARA TAREA)
-        op = random.choice(OPERACIONES)
-        zona = random.choice(ZONAS)
+    op = random.choice(OPERACIONES)
+    zona = zipf_choice(ZONAS)
 
-    conf = random.choice([0.3, 0.5, 0.7])
-
-    consulta = {
+    q = {
         "request_id": str(uuid.uuid4()),
         "operacion": op,
         "zona_id": zona,
-        "confidence_min": conf,
-        "bbox": {}
+        "confidence_min": random.choice([0.3, 0.5, 0.7])
     }
 
     if op == "Q4":
         otros = [z for z in ZONAS if z != zona]
-        consulta["zona_id_a"] = zona
-        consulta["zona_id_b"] = random.choice(otros)
+        q["zona_id_a"] = zona
+        q["zona_id_b"] = random.choice(otros)
 
     if op == "Q5":
-        consulta["bins"] = random.choice([5, 10, 15])
+        q["bins"] = random.choice([5, 10, 15])
 
-    return consulta
-
-
-
-def run(n=20):
-
-    print("== GENERADOR DE TRÁFICO INICIADO ==")
-
-    session = requests.Session()
-
-    for i in range(n):
-
-        consulta = generar_consulta()
-
-        print(f"\n--- QUERY {i+1} ---")
-        print(json.dumps(consulta, indent=2))
-
-        try:
-            respuesta = session.post(URL_CACHE, json=consulta, timeout=(2, 8))
-
-            print("STATUS:", respuesta.status_code)
-
-            try:
-                print(respuesta.json())
-            except:
-                print("RESPUESTA NO JSON")
-
-        except Exception as e:
-            print("ERROR:", str(e))
-
-        time.sleep(INTERVALO)
-
-    print("== FIN ==")
-    sys.exit(0)
+    return q
 
 
-if __name__ == "__main__":
-    run(20)
+
+print(" GENERADOR DE TRFICO")
+
+for i in range(20):
+
+    consulta = generar_consulta()
+
+    print(f"Enviando consulta {i+1} → {consulta['request_id']} | {consulta['operacion']}")
+
+    producer.send(TOPIC, consulta)
+    producer.flush()
+
+    time.sleep(INTERVALO)
+

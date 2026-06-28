@@ -1,4 +1,6 @@
-Flask==3.0.2
-redis==5.0.3
-requests==2.31.0
+kafka-python==2.0.2
+redis==5.0.1
+flask==3.0.0
 numpy
+requests
+

@@ -2,74 +2,140 @@ import os
 import json
 import time
 import redis
+import threading
 import requests
-import numpy as np
-from flask import Flask, request, jsonify
 from collections import OrderedDict
+from kafka import KafkaConsumer, KafkaProducer
 
-app = Flask(__name__)
+print("SERVICIO DE CACHE INICIADO", flush=True)
 
 
-#FIFO :Saca la ms antigua.
-#LRU : Saca la menos usada recientemente.
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
 
-politica = os.getenv("POLITICA", "LRU")
-tamano_cache = int(os.getenv("TAMANO", 5))
-ttl_segundos = int(os.getenv("TTL", 60))
+POLITICA = os.getenv("POLITICA", "LRU")
+TAMANO = int(os.getenv("TAMANO", 5))
+TTL = int(os.getenv("TTL", 60))
 
-redis_host = os.getenv("REDIS_HOST", "redis")
-redis_port = int(os.getenv("REDIS_PORT", 6379))
+URL_METRICAS = os.getenv("URL_METRICAS", "http://contenedor-metricas:5002/registrar")
 
-url_respuestas = "http://contenedor-respuestas:5001/compute"
-url_metricas = "http://contenedor-metricas:5002/registrar"
+hits = 0
+misses = 0
+basura = 0
+evicciones = 0
 
-redis_cliente = redis.Redis(
-    host=redis_host,
-    port=redis_port,
+latencias = []
+tiempos = []
+
+lock_metricas = threading.Lock()
+
+
+redis_cli = redis.Redis(
+    host=os.getenv("REDIS_HOST", "redis"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
     decode_responses=True
 )
 
-redis_cliente.ping()
+print("CONECTANDO REDIS...........", flush=True)
 
-# ---------------- ESTRUCTURAS ----------------
-fifo = []
-lru = OrderedDict()
-latencias = []
-
-
-# ---------------- MÉTRICAS ----------------
-def registrar_evento(tipo, llave=None, latencia=None):
-
-    evento = {
-        "evento": tipo,
-        "llave": llave,
-        "latencia": latencia,
-        "politica": politica,
-        "ttl": ttl_segundos,
-        "tamano": tamano_cache
-    }
-
-    if latencia is not None:
-        latencias.append(latencia)
-
-    # peso cache
-    if llave:
-        try:
-            val = redis_cliente.get(llave)
-            if val:
-                evento["peso_bytes"] = len(val.encode("utf-8"))
-        except:
-            evento["peso_bytes"] = 0
-
+while True:
     try:
-        requests.post(url_metricas, json=evento, timeout=1)
+        redis_cli.ping()
+        break
+    except:
+        time.sleep(2)
+
+print("REDIS OK", flush=True)
+
+
+def enviar_metricas(evento):
+    try:
+        requests.post(URL_METRICAS, json=evento, timeout=1)
     except:
         pass
 
 
-# ---------------- KEY BUILDER ----------------
-def construir_llave(q):
 
+def crear_consumer(topico, grupo):
+    while True:
+        try:
+            return KafkaConsumer(
+                topico,
+                bootstrap_servers=KAFKA_BROKER,
+                value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+                auto_offset_reset="earliest",
+                enable_auto_commit=True,
+                group_id=grupo
+            )
+        except Exception as e:
+            print("ERROR CONSUMER...:", e, flush=True)
+            time.sleep(3)
+
+
+def crear_producer():
+    while True:
+        try:
+            return KafkaProducer(
+                bootstrap_servers=KAFKA_BROKER,
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                acks="all",
+                retries=10
+            )
+        except Exception as e:
+            print("ERROR PRODUCER....-.:", e, flush=True)
+            time.sleep(3)
+
+
+consumer_queries = crear_consumer("queries", "cache-queries-group")
+consumer_responses = crear_consumer("responses", "cache-responses-group")
+producer = crear_producer()
+
+print("WORKER.. INICIADO..", flush=True)
+
+
+lru = OrderedDict()
+lock = threading.Lock()
+
+
+
+def normalizar(k):
+    return str(k).strip().lower()
+
+
+
+def registrar_evento(tipo, request_id=None, clave=None, latencia=None):
+    global hits, misses, basura, evicciones
+
+    evento = {
+        "evento": tipo,
+        "request_id": request_id,
+        "clave": clave,
+        "latencia": latencia,
+        "timestamp": time.time(),
+        "politica": POLITICA,
+        "tamano": TAMANO,
+        "ttl": TTL
+    }
+
+    with lock_metricas:
+        if tipo == "hit":
+            hits += 1
+        elif tipo == "miss":
+            misses += 1
+        elif tipo == "basura":
+            basura += 1
+        elif tipo == "eviccion":
+            evicciones += 1
+
+        if latencia is not None:
+            latencias.append(latencia)
+
+        tiempos.append(time.time())
+
+    enviar_metricas(evento)
+
+
+
+def construir_clave(q):
     op = q.get("operacion")
     zona = q.get("zona_id")
     conf = q.get("confidence_min", 0.5)
@@ -77,139 +143,135 @@ def construir_llave(q):
 
     if op == "Q1":
         return f"count:{zona}:conf={conf}"
-
     if op == "Q2":
         return f"area:{zona}:conf={conf}"
-
     if op == "Q3":
         return f"density:{zona}:conf={conf}"
-
     if op == "Q4":
-        a = q.get("zona_id_a")
-        b = q.get("zona_id_b")
-        if a and b:
-            a, b = sorted([a, b])
+        a, b = sorted([q.get("zona_id_a"), q.get("zona_id_b")])
         return f"compare:{a}:{b}:conf={conf}"
-
     if op == "Q5":
         return f"dist:{zona}:bins={bins}"
 
     return None
 
 
-# ---------------- VALIDACIÓN ----------------
-def validar_consulta(q):
-    op = q.get("operacion")
 
-    if op not in ["Q1", "Q2", "Q3", "Q4", "Q5"]:
-        return False
-
-    if op in ["Q1", "Q2", "Q3", "Q5"] and not q.get("zona_id"):
-        return False
-
-    if op == "Q4":
-        return bool(q.get("zona_id_a") and q.get("zona_id_b"))
-
-    return True
+def actualizar_cache(k):
+    with lock:
+        k = normalizar(k)
+        lru.pop(k, None)
+        lru[k] = time.time()
 
 
-# ---------------- CACHE CONTROL ----------------
-def actualizar_indice(llave):
-    if politica == "LRU":
-        if llave in lru:
-            lru.pop(llave)
-        lru[llave] = time.time()
-    else:
-        if llave in fifo:
-            fifo.remove(llave)
-        fifo.append(llave)
+def eliminar_exceso():
+    global evicciones
+
+    with lock:
+        while len(lru) > TAMANO:
+            viejo, _ = lru.popitem(last=False)
+
+            redis_cli.delete(viejo)
+
+            evicciones += 1
+            registrar_evento("eviccion", clave=viejo)
+
+            print("EVICTION : ", viejo, flush=True)
 
 
-def expulsar():
-    estructura = fifo if politica == "FIFO" else lru
 
-    while len(estructura) > tamano_cache:
-        if politica == "FIFO":
-            vieja = fifo.pop(0)
-        else:
-            vieja, _ = lru.popitem(last=False)
+def worker_queries():
+    print("WORKER CONSULTAS INICIADO", flush=True)
 
-        redis_cliente.delete(vieja)
-        registrar_evento("eviccion", llave=vieja)
+    while True:
+        msg_pack = consumer_queries.poll(timeout_ms=1000)
 
+        if not msg_pack:
+            continue
 
-# ---------------- QUERY ----------------
-@app.route("/query", methods=["POST"])
-def query():
+        for _, mensajes in msg_pack.items():
+            for msg in mensajes:
 
-    inicio = time.time()
-    q = request.json
+                inicio = time.time()
 
-    if not validar_consulta(q):
-        registrar_evento("basura")
-        return jsonify({"estado": "error"}), 400
+                q = msg.value
+                request_id = q.get("request_id")
 
-    llave = construir_llave(q)
+                clave = construir_clave(q)
+                if clave:
+                    clave = normalizar(clave)
 
-    if not llave:
-        registrar_evento("basura")
-        return jsonify({"estado": "error"}), 400
+                print("\nCONSULTA RECIBIDA", flush=True)
+                print(json.dumps(q, indent=2), flush=True)
+                print("CLAVE:", clave, flush=True)
 
-    # ---------------- HIT ----------------
-    cache = redis_cliente.get(llave)
+                if not clave:
+                    registrar_evento("basura", request_id=request_id)
+                    continue
 
-    if cache:
-        actualizar_indice(llave)
-        registrar_evento("hit", llave, time.time() - inicio)
+                valor = redis_cli.get(clave)
 
-        return jsonify({
-            "origen": "cache",
-            "resultado": json.loads(cache)
-        }), 200
+                
+                if valor is not None:
+                    lat = time.time() - inicio
+                    registrar_evento("hit", request_id, clave, lat)
+                    actualizar_cache(clave)
 
-    # ---------------- MISS ----------------
-    try:
-        resp = requests.post(url_respuestas, json=q, timeout=(2, 6))
+                    print("RESULTADO: HIT ->", clave, flush=True)
 
-        if resp.status_code != 200:
-            registrar_evento("error", llave, time.time() - inicio)
-            return jsonify({"estado": "error"}), 500
+                
+                else:
+                    lat = time.time() - inicio
+                    registrar_evento("miss", request_id, clave, lat)
 
-        body = resp.json()
+                    print("RESULTADO: MISS ->", clave, flush=True)
 
-        data = body.get("resultado", {})
-
-        redis_cliente.setex(llave, ttl_segundos, json.dumps(data))
-
-        actualizar_indice(llave)
-        expulsar()
-
-        registrar_evento("miss", llave, time.time() - inicio)
-
-        return jsonify({
-            "origen": "generador-respuesta",
-            "resultado": data
-        }), 200
-
-    except:
-        registrar_evento("error", llave, time.time() - inicio)
-        return jsonify({"estado": "caido"}), 200
+                    producer.send("cache_miss", {
+                        "request_id": request_id,
+                        "key": clave,
+                        "request": q
+                    })
+                    producer.flush()
 
 
-# ---------------- LATENCIAS ----------------
-@app.route("/latencias", methods=["GET"])
-def latencias_endpoint():
 
-    if not latencias:
-        return jsonify({"mensaje": "sin datos"}), 200
+def worker_respuestas():
+    print("WORKER RESPUESTAS INICIADO", flush=True)
 
-    return jsonify({
-        "p50": float(np.percentile(latencias, 50)),
-        "p90": float(np.percentile(latencias, 90)),
-        "p95": float(np.percentile(latencias, 95)),
-        "promedio": float(np.mean(latencias))
-    })
+    while True:
+        msg_pack = consumer_responses.poll(timeout_ms=1000)
+
+        if not msg_pack:
+            continue
+
+        for _, mensajes in msg_pack.items():
+            for msg in mensajes:
+
+                d = msg.value
+
+                clave = d.get("key")
+                resultado = d.get("resultado")
+
+                if not clave or resultado is None:
+                    continue
+
+                clave = normalizar(clave)
+
+                redis_cli.setex(clave, TTL, json.dumps(resultado))
+
+                actualizar_cache(clave)
+                eliminar_exceso()
+
+                registrar_evento("respuesta", clave=clave)
+
+                print("CACHE ACTUALIZADO ->", clave, flush=True)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    threading.Thread(target=worker_queries, daemon=True).start()
+    threading.Thread(target=worker_respuestas, daemon=True).start()
+
+    print("CACHE CORRIENDOO", flush=True)
+
+    while True:
+        time.sleep(10)
