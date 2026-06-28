@@ -18,7 +18,7 @@ TTL = int(os.getenv("TTL", 60))
 
 MAX_RETRIES = 3
 
-URL_METRICAS = os.getenv("URL_METRICAS", "http://contenedor-metricas:5002/registrar")
+URL_METRICAS = os.getenv("URL_METRICAS", "http://metricas:5002/registrar")
 
 
 hits = 0

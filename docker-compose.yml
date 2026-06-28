@@ -7,6 +7,7 @@ services:
       - "6379:6379"
     restart: unless-stopped
 
+
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
@@ -16,6 +17,7 @@ services:
     ports:
       - "2181:2181"
     restart: unless-stopped
+
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -27,82 +29,109 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       ALLOW_PLAINTEXT_LISTENER: "yes"
-
-    healthcheck:
-      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
-      interval: 10s
-      timeout: 10s
-      retries: 10
-
     restart: unless-stopped
+
+
 
   servicio-cache:
     build: ./cache
     container_name: contenedor-cache
     depends_on:
       kafka:
-        condition: service_healthy
+        condition: service_started
       redis:
         condition: service_started
     environment:
       KAFKA_BROKER: kafka:9092
       REDIS_HOST: redis
       REDIS_PORT: "6379"
+      URL_METRICAS: http://metricas:5002/registrar
     ports:
       - "5000:5000"
     restart: unless-stopped
 
+
+  
   generador-trafico:
     build: ./generador-trafico
     container_name: contenedor-trafico
     depends_on:
       kafka:
-        condition: service_healthy
+        condition: service_started
     environment:
       KAFKA_BROKER: kafka:9092
     restart: "no"
 
+
   generador-respuestas:
     build: ./generador-respuestas
     container_name: contenedor-respuestas
-
     depends_on:
       kafka:
-        condition: service_healthy
-
+        condition: service_started
     environment:
       KAFKA_BROKER: kafka:9092
-
     restart: unless-stopped
-  
 
+
+  
   metricas:
     build: ./Metricas
     container_name: contenedor-metricas
-
     depends_on:
-      - redis
-
+      kafka:
+        condition: service_started
     environment:
+      KAFKA_BROKER: kafka:9092
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-
     ports:
       - "5002:5002"
-
     restart: unless-stopped
 
-    
+
+  
+  spark:
+    build: ./procesamiento-streaming
+    container_name: contenedor-spark
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BROKER: kafka:9092
+    command: >
+      spark-submit
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
+      /app/job_spark.py
+    ports:
+      - "4040:4040"
+    restart: unless-stopped
+
+
+  
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+    ports:
+      - "9200:9200"
+    restart: unless-stopped
+
+
+ 
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: kibana
+    depends_on:
+      - elasticsearch
+    environment:
+      ELASTICSEARCH_HOSTS: "http://elasticsearch:9200"
+    ports:
+      - "5601:5601"
+    restart: unless-stopped

@@ -2,3 +2,4 @@ Flask==3.0.3
 numpy==2.0.0
 redis==5.0.7
 requests
+kafka-python
