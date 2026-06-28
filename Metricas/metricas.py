@@ -69,6 +69,7 @@ def reporte():
     misses = sum(1 for e in EVENTOS if e.get("evento") == "miss")
     basura = sum(1 for e in EVENTOS if e.get("evento") == "basura")
     evicciones = sum(1 for e in EVENTOS if e.get("evento") == "eviction")
+    dlq = sum(1 for e in EVENTOS if e.get("evento") == "dlq")
 
     respuestas = sum(1 for e in EVENTOS if e.get("evento") == "respuesta")
 
@@ -126,12 +127,13 @@ def reporte():
         },
 
         "metricas_rendimiento": {
-            "latencia_promedio_seg": round(promedio, 4),
+            "latencia_promedio_seg": round(promedio,4),
             "p50": p50,
             "p90": p90,
             "p95": p95,
             "throughput_eventos_por_seg": throughput,
-            "evicciones": evicciones
+            "evicciones": evicciones,
+            "dlq": dlq
         },
 
         "analisis_espacio_redis": {
