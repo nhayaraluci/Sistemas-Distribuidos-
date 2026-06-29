@@ -1,7 +1,7 @@
 import os
 import time
-import redis
 import json
+import redis
 from flask import Flask, request, jsonify
 from kafka import KafkaProducer
 
@@ -9,15 +9,9 @@ app = Flask(__name__)
 
 EVENTOS = []
 
-CONFIG = {
-    "politica": None,
-    "tamano": None,
-    "ttl": None
-}
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
+TOPIC = "metrics-topic"
 
-# =========================
-# REDIS
-# =========================
 
 redis_cliente = redis.Redis(
     host=os.getenv("REDIS_HOST", "redis"),
@@ -25,114 +19,94 @@ redis_cliente = redis.Redis(
     decode_responses=True
 )
 
-# Esperar Redis
 while True:
     try:
         redis_cliente.ping()
-        print("Redis conectado ✔", flush=True)
+        print("[METRICAS] Redis OK ✔", flush=True)
         break
-    except Exception:
-        print("Esperando Redis...", flush=True)
+    except:
+        print("[METRICAS] esperando Redis...", flush=True)
         time.sleep(2)
-
-# =========================
-# KAFKA
-# =========================
-
-KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
 
 
 def crear_producer():
     while True:
         try:
-            producer = KafkaProducer(
+            p = KafkaProducer(
                 bootstrap_servers=KAFKA_BROKER,
                 value_serializer=lambda v: json.dumps(v).encode("utf-8"),
                 acks="all",
                 retries=10
             )
-
-            print("Kafka Producer conectado ✔", flush=True)
-            return producer
-
+            print("[METRICAS] Kafka OK ✔", flush=True)
+            return p
         except Exception as e:
-            print(f"Esperando Kafka... ({e})", flush=True)
+            print("[METRICAS] esperando Kafka...", repr(e), flush=True)
             time.sleep(3)
-
 
 producer = crear_producer()
 
-# =========================
-# NORMALIZAR EVENTOS
-# =========================
 
-def normalizar_evento(evento):
+def normalizar(evento):
+    evento = evento or {}
 
-    tipo = evento.get("evento")
-
-    if tipo in ["eviccion", "eviction"]:
-        evento["evento"] = "eviction"
+    evento.setdefault("tipo", "unknown")
+    evento.setdefault("latencia", 0.0)
+    evento.setdefault("retry_count", 0)
+    evento.setdefault("service", "cache")
+    evento.setdefault("timestamp", time.time())
 
     return evento
 
-# =========================
-# ENDPOINT
-# =========================
+
 
 @app.route("/registrar", methods=["POST"])
 def registrar():
 
-    print("EVENTO RECIBIDO:", request.json, flush=True)
+    evento = request.json
 
-    evento = request.json or {}
+   
+    if not evento:
+        print("[METRICAS] ERROR: evento vacío", flush=True)
+        return jsonify({"ok": False}), 400
 
-    evento["timestamp"] = time.time()
+    
+    print("\n================ METRICA RECIBIDA ================", flush=True)
+    print("[FROM CACHE]:", json.dumps(evento, indent=2), flush=True)
 
-    evento = normalizar_evento(evento)
+    # 🔧 NORMALIZAR
+    evento = normalizar(evento)
 
-    if "politica" in evento:
-        CONFIG["politica"] = evento["politica"]
-
-    if "tamano" in evento:
-        CONFIG["tamano"] = evento["tamano"]
-
-    if "ttl" in evento:
-        CONFIG["ttl"] = evento["ttl"]
+    
+    print("\n[METRICAS] NORMALIZADO:", json.dumps(evento, indent=2), flush=True)
 
     EVENTOS.append(evento)
 
     try:
-        future = producer.send("metrics-topic", evento)
+        future = producer.send(TOPIC, evento)
         metadata = future.get(timeout=10)
 
+       
         print(
-        f"ENVIADO A KAFKA -> topic={metadata.topic}, partition={metadata.partition}, offset={metadata.offset}",
-        flush=True
+            f"\n[METRICAS → KAFKA] OK topic={metadata.topic} "
+            f"partition={metadata.partition} offset={metadata.offset}",
+            flush=True
         )
 
     except Exception as e:
-         print("ERROR KAFKA:", repr(e), flush=True)
+        print("[METRICAS] ERROR KAFKA ", repr(e), flush=True)
 
     return jsonify({"ok": True})
 
-# =========================
-# HEALTH
-# =========================
 
 @app.route("/health")
 def health():
-
     return jsonify({
-        "estado": "ok",
-        "eventos_recibidos": len(EVENTOS),
-        "config": CONFIG
+        "status": "ok",
+        "eventos_recibidos": len(EVENTOS)
     })
 
-# =========================
 
 if __name__ == "__main__":
-
-    app.run(
-        host="0.0.0.0",
-        port=5002
-    )
+    print("[METRICAS] SERVICIO INICIADO 🚀", flush=True)
+    app.run(host="0.0.0.0", port=5002)

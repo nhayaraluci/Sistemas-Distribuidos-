@@ -16,18 +16,17 @@ POLITICA = os.getenv("POLITICA", "LRU")
 TAMANO = int(os.getenv("TAMANO", 5))
 TTL = int(os.getenv("TTL", 60))
 
-MAX_RETRIES = 3
+MAX_RETRIES = 2
+TIEMPO_REINTENTO = 5
 
 URL_METRICAS = os.getenv("URL_METRICAS", "http://metricas:5002/registrar")
 
-
 hits = 0
 misses = 0
-basura = 0
-evicciones = 0
-dlq = 0
+dlq_count = 0
+retry_count_global = 0
 
-lock_metricas = threading.Lock()
+lock_metrics = threading.Lock()
 
 
 redis_cli = redis.Redis(
@@ -35,8 +34,6 @@ redis_cli = redis.Redis(
     port=int(os.getenv("REDIS_PORT", 6379)),
     decode_responses=True
 )
-
-
 
 while True:
     try:
@@ -48,20 +45,19 @@ while True:
 print("REDIS OK", flush=True)
 
 
-def crear_consumer(topico, grupo):
+def crear_consumer(topic, group):
     while True:
         try:
             return KafkaConsumer(
-                topico,
+                topic,
                 bootstrap_servers=KAFKA_BROKER,
                 value_deserializer=lambda v: json.loads(v.decode("utf-8")),
                 auto_offset_reset="earliest",
                 enable_auto_commit=True,
-                group_id=grupo
+                group_id=group
             )
         except:
             time.sleep(3)
-
 
 def crear_producer():
     while True:
@@ -75,70 +71,50 @@ def crear_producer():
         except:
             time.sleep(3)
 
-
 consumer_queries = crear_consumer("queries", "cache-queries-group")
 consumer_responses = crear_consumer("responses", "cache-responses-group")
-
-
 consumer_dlq = crear_consumer("cache_dlq", "cache-dlq-group")
 
 producer = crear_producer()
 
-print("WORKERS INICIADOS", flush=True)
+print("KAFKA OK", flush=True)
 
 
 lru = OrderedDict()
-lock = threading.Lock()
-
+lock_lru = threading.Lock()
 
 pendientes = {}
-lock_pendientes = threading.Lock()
+lock_pending = threading.Lock()
 
-TIEMPO_REINTENTO = 5   
 
-def registrar_evento(tipo):
+def enviar_metricas(tipo, clave=None, retry=0, latencia=0.0):
 
-    global hits, misses, basura, evicciones , dlq
-    
-    
-    config_evento = {
-    "evento": "config_init",
-    "politica": POLITICA,
-    "tamano": TAMANO,
-    "ttl": TTL
+    global hits, misses, dlq_count, retry_count_global
+
+    evento = {
+        "timestamp": time.time(),
+        "tipo": tipo,
+        "clave": clave,
+        "retry_count": retry,
+        "latencia": float(latencia),
+        "service": "cache"
     }
 
     try:
-        requests.post(URL_METRICAS, json=config_evento, timeout=1)
-    except:
-            pass
+        requests.post(URL_METRICAS, json=evento, timeout=1)
+    except Exception as e:
+        print("ERROR METRICAS:", e, flush=True)
 
-    with lock_metricas:
-
+    with lock_metrics:
         if tipo == "hit":
             hits += 1
-
         elif tipo == "miss":
             misses += 1
-
-        elif tipo == "basura":
-            basura += 1
-
-        elif tipo == "eviccion":
-            evicciones += 1
-            
         elif tipo == "dlq":
-            dlq += 1
+            dlq_count += 1
+        elif tipo == "retry":
+            retry_count_global += 1
 
-    try:
-        r=requests.post(
-            URL_METRICAS,
-            json={"evento": tipo},
-            timeout=2
-        )
-        print("Metricas:", r.status_code, flush=True)
-    except Exception as e:
-        print("ERROR enviando metricas:", e, flush=True)
 
 def construir_clave(q):
     op = q.get("operacion")
@@ -154,235 +130,191 @@ def construir_clave(q):
         return f"density:{zona}:conf={conf}"
     if op == "Q5":
         return f"dist:{zona}:bins={bins}"
-
     return None
 
 
-def actualizar_cache(k):
-    with lock:
+def touch_cache(k):
+    with lock_lru:
         lru.pop(k, None)
         lru[k] = time.time()
 
-
-def eliminar_exceso():
-    with lock:
+def evict_if_needed():
+    with lock_lru:
         while len(lru) > TAMANO:
-            viejo, _ = lru.popitem(last=False)
-            redis_cli.delete(viejo)
+            old, _ = lru.popitem(last=False)
+            redis_cli.delete(old)
+            print("EVICTION ->", old, flush=True)
+            enviar_metricas("eviction", old)
 
-            registrar_evento("eviccion")
-            print(" EVICTION ->", viejo, flush=True)
 
 def worker_queries():
-    print("WORKER CONSULTAS INICIADO", flush=True)
+    print("WORKER QUERIES LISTO", flush=True)
 
     while True:
         msg_pack = consumer_queries.poll(timeout_ms=1000)
 
-        for _, mensajes in msg_pack.items():
-            for msg in mensajes:
+        for _, msgs in msg_pack.items():
+            for msg in msgs:
 
                 q = msg.value
-                request_id = q.get("request_id")
                 clave = construir_clave(q)
 
-                print("\n CONSULTA ->", clave, flush=True)
+                print("\nCONSULTA:", clave, flush=True)
 
                 if not clave:
-                    registrar_evento("basura")
+                    enviar_metricas("bad")
                     continue
 
                 if redis_cli.get(clave):
-                    registrar_evento("hit")
-                    actualizar_cache(clave)
-                    print(" HIT ->", clave, flush=True)
-                else:
-                    registrar_evento("miss")
-                    print(" MISS ->", clave, flush=True)
+                    print("HIT ->", clave, flush=True)
+                    enviar_metricas("hit", clave)
+                    touch_cache(clave)
+                    continue
 
-                    mensaje = {
-                        "request_id": request_id,
-                        "key": clave,
-                        "request": q,
-                        "retry_count": 0,
-                        "inicio": time.time()
-                    }
+                print("MISS ->", clave, flush=True)
+                enviar_metricas("miss", clave)
 
-                    producer.send("cache_miss", mensaje)
-                    producer.flush()
-                    
-                    
+                mensaje = {
+                    "key": clave,
+                    "request": q,
+                    "retry_count": 0,
+                    "inicio": time.time()
+                }
 
-                    with lock_pendientes:
+                with lock_pending:
+                    if clave not in pendientes:
                         pendientes[clave] = {
                             "mensaje": mensaje,
                             "ultimo_envio": time.time()
                         }
 
-                    print("----------------------------------------")
-                    print("CACHE MISS")
-                    print("Consulta enviada a Kafka (cache_miss)")
-                    print("Esperando respuesta del generador...")
-                    print("----------------------------------------", flush=True)
+                producer.send("cache_miss", mensaje)
+                producer.flush()
 
-          
+                print("Esperando respuesta del generador...", flush=True)
+
+
 def worker_timeout():
-
-    print("WORKER TIMEOUT INICIADO", flush=True)
+    print("TIMEOUT WORKER INICIADO", flush=True)
 
     while True:
-
         time.sleep(1)
 
-        with lock_pendientes:
-            
-            copiar = list(pendientes.items())
+        with lock_pending:
+            copia = list(pendientes.items())
 
-        for clave, info in copiar:
+        for clave, info in copia:
 
             if time.time() - info["ultimo_envio"] < TIEMPO_REINTENTO:
                 continue
 
-            mensaje = info["mensaje"]
+            msg = info["mensaje"]
 
-            retry = mensaje.get("retry_count", 0) + 1
+           
+            retry = msg.get("retry_count", 0) + 1
+            msg["retry_count"] = retry
 
-            mensaje["retry_count"] = retry
+            print("RETRY", retry, "/", MAX_RETRIES+1 , "->", clave, flush=True)
+            enviar_metricas("retry", clave, retry)
 
             if retry <= MAX_RETRIES:
 
-                print("----------------------------------------")
-                print("TIMEOUT")
-                print("No llegó respuesta.")
-                print(f"Retry {retry} de {MAX_RETRIES}")
-                print("KEY:", clave)
-                print("Reenviando consulta...")
-                print("----------------------------------------", flush=True)
-
-                producer.send("cache_miss", mensaje)
+                producer.send("cache_miss", msg)
                 producer.flush()
 
-                with lock_pendientes:
-                    pendientes[clave]["ultimo_envio"] = time.time()
+                with lock_pending:
+                    if clave in pendientes:
+                        pendientes[clave]["ultimo_envio"] = time.time()
 
             else:
-                 
-                mensaje["retry_count"] = MAX_RETRIES
 
-                producer.send("cache_dlq", mensaje)
+                print("DLQ ->", clave, flush=True)
+
+                producer.send("cache_dlq", msg)
                 producer.flush()
-                
-                registrar_evento("dlq")
 
-                print("----------------------------------------")
-                print("MAXIMO DE REINTENTOS")
-                print("Consulta enviada a cache_dlq")
-                print("KEY:", clave)
-                print("----------------------------------------", flush=True)
+                enviar_metricas("dlq", clave, retry)
 
-                with lock_pendientes:
-                    del pendientes[clave]
-   
+                with lock_pending:
+                    pendientes.pop(clave, None)
+
+
+
 def worker_respuestas():
-
-    print("WORKER RESPUESTAS INICIADO", flush=True)
+    print("WORKER RESPUESTAS LISTO", flush=True)
 
     while True:
-
         msg_pack = consumer_responses.poll(timeout_ms=1000)
 
-        for _, mensajes in msg_pack.items():
-
-            for msg in mensajes:
+        for _, msgs in msg_pack.items():
+            for msg in msgs:
 
                 d = msg.value
-
                 clave = d.get("key")
-                resultado = d.get("resultado")
-                inicio = d.get("inicio")
-
-                latencia = time.time() - inicio if inicio else None
-                    
-                with lock_pendientes:
-                    if clave not in pendientes:
-                        print("----------------------------------------")
-                        print("RESPUESTA TARDIA DESCARTADA")
-                        print("KEY:", clave)
-                        print("La consulta ya habia sido enviada a DLQ")
-                        print("----------------------------------------")
-                        continue
 
                 if not clave:
                     continue
 
+                inicio = d.get("inicio", time.time())
+                latencia = time.time() - inicio
+
+                print("RESPUESTA ->", clave, flush=True)
+
+                
                 redis_cli.setex(
                     clave,
                     TTL,
-                    json.dumps(resultado)
+                    json.dumps(d.get("resultado"))
                 )
-                try:
-                    r=requests.post(
-                        URL_METRICAS,
-                        json={
-                            "evento": "respuesta",
-                            "latencia": latencia,
-                            "retry_count": d.get("retry_count", 0)
-                        },
-                        timeout=2
-                    )
-                    print("Metricas:", r.status_code, flush=True)
-                except Exception as e:
-                    print("ERROR enviando metricas:", e, flush=True)
 
-                actualizar_cache(clave)
-                eliminar_exceso()
-
-                with lock_pendientes:
-                    if clave in pendientes:
-                        del pendientes[clave]
-
-                print("----------------------------------------")
-                print("RESPUESTA RECIBIDA")
-                print("KEY:", clave)
-                print("Resultado almacenado en Redis")
-                print("Consulta eliminada de pendientes")
-                print("----------------------------------------", flush=True)
                 
-                             
+                with lock_pending:
+                    retry = pendientes.get(clave, {}).get("mensaje", {}).get("retry_count", 0)
+
+                
+                enviar_metricas(
+                    "response",
+                    clave,
+                    retry,
+                    latencia
+                )
+
+                touch_cache(clave)
+                evict_if_needed()
+
+                with lock_pending:
+                    pendientes.pop(clave, None)
+
+                print("Guardado en cache:", clave, flush=True)
+
 
 def worker_dlq():
-
-    print("WORKER DLQ INICIADO", flush=True)
+    print("DLQ WORKER LISTO", flush=True)
 
     while True:
-
         msg_pack = consumer_dlq.poll(timeout_ms=1000)
 
-        for _, mensajes in msg_pack.items():
-
-            for msg in mensajes:
+        for _, msgs in msg_pack.items():
+            for msg in msgs:
 
                 d = msg.value
 
-                print("")
-                print("========================================")
+                print("\n==============================")
                 print("DEAD LETTER QUEUE")
-                print("========================================")
-                print("KEY:", d["key"])
-                print("REINTENTOS:", d["retry_count"])
-                print("CONSULTA ORIGINAL:")
-                print(json.dumps(d["request"], indent=4))
-                print("========================================")
-                print("")
-                
+                print("KEY:", d.get("key"))
+                print("RETRIES:", d.get("retry_count"))
+                print("REQUEST:", json.dumps(d.get("request"), indent=2))
+                print("==============================\n", flush=True)
+
 
 if __name__ == "__main__":
+
     threading.Thread(target=worker_queries, daemon=True).start()
-    threading.Thread(target=worker_respuestas, daemon=True).start()
     threading.Thread(target=worker_timeout, daemon=True).start()
+    threading.Thread(target=worker_respuestas, daemon=True).start()
     threading.Thread(target=worker_dlq, daemon=True).start()
 
-    print("CACHE RUNNING ", flush=True)
+    print("CACHE RUNNING FULL OBSERVABILITY", flush=True)
 
     while True:
         time.sleep(10)
