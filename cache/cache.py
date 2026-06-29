@@ -131,13 +131,14 @@ def registrar_evento(tipo):
             dlq += 1
 
     try:
-        requests.post(
+        r=requests.post(
             URL_METRICAS,
             json={"evento": tipo},
-            timeout=1
+            timeout=2
         )
-    except:
-        pass
+        print("Metricas:", r.status_code, flush=True)
+    except Exception as e:
+        print("ERROR enviando metricas:", e, flush=True)
 
 def construir_clave(q):
     op = q.get("operacion")
@@ -300,9 +301,7 @@ def worker_respuestas():
                 resultado = d.get("resultado")
                 inicio = d.get("inicio")
 
-                latencia = None
-                if inicio is not None:
-                    latencia = time.time() - inicio
+                latencia = time.time() - inicio if inicio else None
                     
                 with lock_pendientes:
                     if clave not in pendientes:
@@ -322,16 +321,18 @@ def worker_respuestas():
                     json.dumps(resultado)
                 )
                 try:
-                    requests.post(
+                    r=requests.post(
                         URL_METRICAS,
                         json={
                             "evento": "respuesta",
-                            "latencia": latencia
+                            "latencia": latencia,
+                            "retry_count": d.get("retry_count", 0)
                         },
-                        timeout=1
+                        timeout=2
                     )
-                except:
-                    pass
+                    print("Metricas:", r.status_code, flush=True)
+                except Exception as e:
+                    print("ERROR enviando metricas:", e, flush=True)
 
                 actualizar_cache(clave)
                 eliminar_exceso()

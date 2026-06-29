@@ -40,7 +40,7 @@ def crear_consumidor():
         "cache_miss",
         bootstrap_servers=KAFKA_BROKER,
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-        auto_offset_reset="latest",
+        auto_offset_reset="earliest",
         group_id="generador-respuestas"
     )
 
@@ -138,8 +138,10 @@ for mensaje in consumidor:
     resultado = procesar_consulta(datos)
 
     respuesta = {
-        "key": datos["key"],
-        "resultado": resultado
+    "key": datos["key"],
+    "resultado": resultado,
+    "inicio": datos["inicio"],
+    "retry_count": datos.get("retry_count", 0)
     }
 
     productor.send("responses", respuesta)

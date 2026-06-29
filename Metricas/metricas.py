@@ -82,6 +82,8 @@ def normalizar_evento(evento):
 @app.route("/registrar", methods=["POST"])
 def registrar():
 
+    print("EVENTO RECIBIDO:", request.json, flush=True)
+
     evento = request.json or {}
 
     evento["timestamp"] = time.time()
@@ -100,11 +102,16 @@ def registrar():
     EVENTOS.append(evento)
 
     try:
-        producer.send("metrics-topic", evento)
-        producer.flush()
+        future = producer.send("metrics-topic", evento)
+        metadata = future.get(timeout=10)
+
+        print(
+        f"ENVIADO A KAFKA -> topic={metadata.topic}, partition={metadata.partition}, offset={metadata.offset}",
+        flush=True
+        )
 
     except Exception as e:
-        print("Error enviando a Kafka:", e, flush=True)
+         print("ERROR KAFKA:", repr(e), flush=True)
 
     return jsonify({"ok": True})
 

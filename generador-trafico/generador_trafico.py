@@ -91,7 +91,7 @@ def generar_consulta():
 
 print(" GENERADOR DE TRFICO")
 
-for i in range(20):
+for i in range(10):
 
     consulta = generar_consulta()
 
