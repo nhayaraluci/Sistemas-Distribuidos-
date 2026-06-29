@@ -7,7 +7,6 @@ services:
       - "6379:6379"
     restart: unless-stopped
 
-
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
@@ -17,7 +16,6 @@ services:
     ports:
       - "2181:2181"
     restart: unless-stopped
-
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -36,8 +34,6 @@ services:
       ALLOW_PLAINTEXT_LISTENER: "yes"
     restart: unless-stopped
 
-
-
   servicio-cache:
     build: ./cache
     container_name: contenedor-cache
@@ -55,8 +51,6 @@ services:
       - "5000:5000"
     restart: unless-stopped
 
-
-  
   generador-trafico:
     build: ./generador-trafico
     container_name: contenedor-trafico
@@ -66,7 +60,6 @@ services:
     environment:
       KAFKA_BROKER: kafka:9092
     restart: "no"
-
 
   generador-respuestas:
     build: ./generador-respuestas
@@ -78,13 +71,13 @@ services:
       KAFKA_BROKER: kafka:9092
     restart: unless-stopped
 
-
-  
   metricas:
     build: ./Metricas
     container_name: contenedor-metricas
     depends_on:
       kafka:
+        condition: service_started
+      redis:
         condition: service_started
     environment:
       KAFKA_BROKER: kafka:9092
@@ -94,44 +87,44 @@ services:
       - "5002:5002"
     restart: unless-stopped
 
-
-  
-  spark:
-    build: ./procesamiento-streaming
-    container_name: contenedor-spark
-    depends_on:
-      - kafka
-    environment:
-      KAFKA_BROKER: kafka:9092
-    command: >
-      spark-submit
-      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
-      /app/job_spark.py
-    ports:
-      - "4040:4040"
-    restart: unless-stopped
-
-
-  
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
     container_name: elasticsearch
     environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
     ports:
       - "9200:9200"
     restart: unless-stopped
 
-
- 
   kibana:
     image: docker.elastic.co/kibana/kibana:8.11.0
     container_name: kibana
     depends_on:
       - elasticsearch
     environment:
-      ELASTICSEARCH_HOSTS: "http://elasticsearch:9200"
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
     ports:
       - "5601:5601"
+    restart: unless-stopped
+
+  spark:
+    build: ./procesamiento-streaming
+    container_name: contenedor-spark
+    depends_on:
+      - kafka
+      - elasticsearch
+
+    environment:
+      KAFKA_BROKER: kafka:9092
+
+    command: >
+      spark-submit
+      --master local[*]
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.elasticsearch:elasticsearch-spark-30_2.12:8.11.0
+      /app/job_spark.py
+
+    ports:
+      - "4040:4040"
     restart: unless-stopped
